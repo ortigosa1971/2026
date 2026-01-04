@@ -1,6 +1,5 @@
 // server.js — sesión única + APIs Weather.com (WU) + lluvia YTD por meses
 // Node >=18 (fetch nativo). Listo para Railway.
-//Prueba david
 
 const express = require('express');
 const session = require('express-session');
@@ -30,16 +29,22 @@ app.use(cors({
   credentials: true
 }));
 app.options('*', cors());
-app.use((req,res,next)=>{ res.header('Vary','Origin'); next(); });
+app.use((req, res, next) => { res.header('Vary', 'Origin'); next(); });
 
-/* ============ Carpetas ============ */
-const DB_DIR = path.join(__dirname, 'db');
+/* ============ Carpetas (Railway) ============ */
+// En Railway, si montas un Volume en /data, pon DATA_DIR=/data en Variables
+const DATA_DIR = (process.env.DATA_DIR || '').trim(); // recomendado: /data
+const DB_DIR = DATA_DIR ? path.join(DATA_DIR, 'db') : path.join(__dirname, 'db');
+
 if (!fs.existsSync(DB_DIR)) fs.mkdirSync(DB_DIR, { recursive: true });
+
 const PUBLIC_DIR = path.join(__dirname, 'public');
 if (!fs.existsSync(PUBLIC_DIR)) fs.mkdirSync(PUBLIC_DIR, { recursive: true });
 
 /* ============ Sesión (SQLite) ============ */
+// Guardamos sesiones dentro de DB_DIR (persistente si DATA_DIR apunta al volume)
 const store = new SQLiteStore({ db: 'sessions.sqlite', dir: DB_DIR });
+
 app.use(session({
   store,
   secret: process.env.SESSION_SECRET || 'change_this_secret',
@@ -47,11 +52,13 @@ app.use(session({
   saveUninitialized: false,
   cookie: {
     httpOnly: true,
+    // En producción con HTTPS (Railway), SameSite=None + Secure es correcto
     sameSite: process.env.SAMESITE || 'none',
     secure: process.env.COOKIE_SECURE === 'true' || process.env.NODE_ENV === 'production',
     maxAge: 1000 * 60 * 60 * 8
   }
 }));
+
 const storeGet = util.promisify(store.get).bind(store);
 const storeDestroy = util.promisify(store.destroy).bind(store);
 
@@ -61,8 +68,11 @@ app.use(express.json());
 app.use(express.static(PUBLIC_DIR));
 
 /* ============ DB usuarios ============ */
-const db = new Database(path.join(DB_DIR, 'usuarios.db'));
+// usuarios.db dentro de DB_DIR (persistente si DATA_DIR=/data)
+const dbPath = path.join(DB_DIR, 'usuarios.db');
+const db = new Database(dbPath);
 db.pragma('journal_mode = wal');
+
 db.prepare(`
   CREATE TABLE IF NOT EXISTS users(
     username TEXT PRIMARY KEY,
@@ -81,13 +91,32 @@ try {
 } catch (e) {
   console.error('No se pudo migrar la tabla users para device_id:', e);
 }
-if (process.env.SEED_ADMIN === '1') {
-  db.prepare("INSERT OR IGNORE INTO users (username,password,session_id) VALUES ('admin','1234',NULL)").run();
+
+/* ============ SEED admin (CORRECCIÓN PRINCIPAL) ============ */
+// Si la tabla está vacía, crea admin automáticamente.
+// Puedes cambiar credenciales con ADMIN_USER y ADMIN_PASS.
+// Si quieres desactivar el seed automático: AUTO_SEED_ADMIN=0
+const AUTO_SEED = (process.env.AUTO_SEED_ADMIN || '1').trim() !== '0';
+if (AUTO_SEED) {
+  try {
+    const any = db.prepare('SELECT 1 FROM users LIMIT 1').get();
+    if (!any) {
+      const adminUser = (process.env.ADMIN_USER || 'admin').trim();
+      const adminPass = (process.env.ADMIN_PASS || '1234').trim();
+      db.prepare('INSERT OR IGNORE INTO users (username,password,session_id,device_id) VALUES (?,?,NULL,NULL)')
+        .run(adminUser, adminPass);
+      console.log(`✅ Seed: usuario creado -> ${adminUser}/${adminPass} (solo si BD estaba vacía)`);
+    } else {
+      console.log('ℹ️ Seed: la tabla users ya tiene usuarios, no se crea admin.');
+    }
+  } catch (e) {
+    console.error('Error haciendo seed del admin:', e);
+  }
 }
 
 /* ============ Healthcheck ============ */
-app.get('/health', (_,res)=>res.status(200).send('OK'));
-app.get('/salud',  (_,res)=>res.status(200).send('OK'));
+app.get('/health', (_, res) => res.status(200).send('OK'));
+app.get('/salud', (_, res) => res.status(200).send('OK'));
 
 /* ============ Raíz / Login ============ */
 app.get('/', (req, res) => {
@@ -100,6 +129,8 @@ function autenticar(username, password) {
   const row = db.prepare('SELECT username,password,session_id,device_id FROM users WHERE username=?').get(username);
   if (!row) return null;
   if (row.password && password && row.password !== password) return null;
+  // Si existe password en BD y NO envían password, también se considera inválido
+  if (row.password && (!password || String(password).trim() === '')) return null;
   return row;
 }
 
@@ -109,7 +140,7 @@ app.post('/login', async (req, res) => {
     const userField = (usuario || username || '').trim();
     if (!userField) return res.redirect('/login.html?error=credenciales');
 
-    // Bloqueo por dispositivo: el front debe enviar un device_id estable (UUID guardado en localStorage)
+    // Bloqueo por dispositivo: el front debe enviar un device_id estable (UUID en localStorage)
     const deviceId = (device_id || '').trim();
     if (!deviceId) return res.redirect('/login.html?error=device_id_required');
 
@@ -121,22 +152,27 @@ app.post('/login', async (req, res) => {
       return res.redirect('/login.html?error=dispositivo_no_autorizado');
     }
 
-    // Primera vez: “registramos” el dispositivo
+    // Primera vez: registramos el dispositivo
     if (!user.device_id) {
       db.prepare('UPDATE users SET device_id=? WHERE username=?').run(deviceId, user.username);
     }
 
+    // Sesión única: si tenía una sesión anterior, la destruimos
     if (user.session_id) {
-      await storeDestroy(user.session_id).catch(()=>{});
+      await storeDestroy(user.session_id).catch(() => {});
       db.prepare('UPDATE users SET session_id=NULL WHERE username=?').run(user.username);
     }
-    await new Promise((resolve,reject)=> req.session.regenerate(err=>err?reject(err):resolve()));
+
+    await new Promise((resolve, reject) => req.session.regenerate(err => err ? reject(err) : resolve()));
+
     const claim = db.prepare('UPDATE users SET session_id=? WHERE username=? AND session_id IS NULL')
-                    .run(req.sessionID, user.username);
+      .run(req.sessionID, user.username);
+
     if (claim.changes === 0) return res.redirect('/login.html?error=sesion_activa');
 
     req.session.usuario = user.username;
     req.session.device_id = deviceId;
+
     res.redirect('/inicio');
   } catch (e) {
     console.error(e);
@@ -151,22 +187,27 @@ async function requiereSesionUnica(req, res, next) {
     const row = db.prepare('SELECT session_id, device_id FROM users WHERE username=?').get(req.session.usuario);
     if (!row) return res.redirect('/login.html');
 
-    // Si el usuario cambió de dispositivo (o intentan reutilizar cookies desde otro), cerramos.
+    // Si intentan reutilizar cookies desde otro dispositivo, fuera
     if (row.device_id && req.session.device_id && row.device_id !== req.session.device_id) {
-      req.session.destroy(()=>res.redirect('/login.html?error=dispositivo_no_autorizado'));
+      req.session.destroy(() => res.redirect('/login.html?error=dispositivo_no_autorizado'));
       return;
     }
 
-    if (!row.session_id) { req.session.destroy(()=>res.redirect('/login.html?error=sesion_invalida')); return; }
-    if (row.session_id !== req.sessionID) { req.session.destroy(()=>res.redirect('/login.html?error=conectado_en_otra_maquina')); return; }
+    if (!row.session_id) { req.session.destroy(() => res.redirect('/login.html?error=sesion_invalida')); return; }
+    if (row.session_id !== req.sessionID) { req.session.destroy(() => res.redirect('/login.html?error=conectado_en_otra_maquina')); return; }
+
     const sess = await storeGet(row.session_id);
     if (!sess) {
       db.prepare('UPDATE users SET session_id=NULL WHERE username=?').run(req.session.usuario);
-      req.session.destroy(()=>res.redirect('/login.html?error=sesion_expirada'));
+      req.session.destroy(() => res.redirect('/login.html?error=sesion_expirada'));
       return;
     }
+
     next();
-  } catch (e) { console.error(e); res.redirect('/login.html?error=interno'); }
+  } catch (e) {
+    console.error(e);
+    res.redirect('/login.html?error=interno');
+  }
 }
 
 /* ============ Rutas protegidas básicas ============ */
@@ -208,7 +249,7 @@ app.get('/api/weather/current', requiereSesionUnica, async (req, res) => {
     const apiKey = process.env.WEATHER_API_KEY || process.env.WU_API_KEY;
     const stationId = req.query.stationId || process.env.WU_STATION_ID;
     const units = req.query.units || 'm';
-    if (!apiKey || !stationId) return res.status(400).json({ error:'config_missing', detalle:'Faltan WEATHER_API_KEY/WU_API_KEY o WU_STATION_ID' });
+    if (!apiKey || !stationId) return res.status(400).json({ error: 'config_missing', detalle: 'Faltan WEATHER_API_KEY/WU_API_KEY o WU_STATION_ID' });
 
     const url = new URL('https://api.weather.com/v2/pws/observations/current');
     url.searchParams.set('stationId', stationId);
@@ -217,13 +258,13 @@ app.get('/api/weather/current', requiereSesionUnica, async (req, res) => {
     url.searchParams.set('apiKey', apiKey);
     url.searchParams.set('numericPrecision', 'decimal');
 
-    const r = await fetch(url, { headers: { 'User-Agent': UA, 'Accept':'application/json,text/plain,*/*', 'Accept-Language':'es-ES,es;q=0.9' }});
+    const r = await fetch(url, { headers: { 'User-Agent': UA, 'Accept': 'application/json,text/plain,*/*', 'Accept-Language': 'es-ES,es;q=0.9' } });
     const ct = (r.headers.get('content-type') || '').toLowerCase();
     const body = await r.text();
-    if (!r.ok) { console.error('Upstream /current', r.status, ct, body.slice(0,300)); return res.status(r.status).json({ error:'weather.com denied', status:r.status }); }
-    if (!ct.includes('application/json')) return res.status(502).json({ error:'Invalid response from weather.com' });
-    res.set('Cache-Control','public, max-age=60').type('application/json').send(body);
-  } catch (e) { console.error(e); res.status(500).json({ error:'Weather proxy failed' }); }
+    if (!r.ok) { console.error('Upstream /current', r.status, ct, body.slice(0, 300)); return res.status(r.status).json({ error: 'weather.com denied', status: r.status }); }
+    if (!ct.includes('application/json')) return res.status(502).json({ error: 'Invalid response from weather.com' });
+    res.set('Cache-Control', 'public, max-age=60').type('application/json').send(body);
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Weather proxy failed' }); }
 });
 
 app.get('/api/weather/history', requiereSesionUnica, async (req, res) => {
@@ -232,8 +273,8 @@ app.get('/api/weather/history', requiereSesionUnica, async (req, res) => {
     const stationId = req.query.stationId || process.env.WU_STATION_ID;
     const { startDate, endDate } = req.query;
     const units = req.query.units || 'm';
-    if (!apiKey || !stationId) return res.status(400).json({ error:'config_missing', detalle:'Faltan WEATHER_API_KEY/WU_API_KEY o WU_STATION_ID' });
-    if (!startDate || !endDate) return res.status(400).json({ error:'params_missing', detalle:'startDate y endDate son obligatorios (YYYYMMDD)' });
+    if (!apiKey || !stationId) return res.status(400).json({ error: 'config_missing', detalle: 'Faltan WEATHER_API_KEY/WU_API_KEY o WU_STATION_ID' });
+    if (!startDate || !endDate) return res.status(400).json({ error: 'params_missing', detalle: 'startDate y endDate son obligatorios (YYYYMMDD)' });
 
     const url = new URL('https://api.weather.com/v2/pws/history/daily');
     url.searchParams.set('stationId', stationId);
@@ -244,13 +285,13 @@ app.get('/api/weather/history', requiereSesionUnica, async (req, res) => {
     url.searchParams.set('apiKey', apiKey);
     url.searchParams.set('numericPrecision', 'decimal');
 
-    const r = await fetch(url, { headers: { 'User-Agent': UA, 'Accept':'application/json,text/plain,*/*', 'Accept-Language':'es-ES,es;q=0.9' }});
+    const r = await fetch(url, { headers: { 'User-Agent': UA, 'Accept': 'application/json,text/plain,*/*', 'Accept-Language': 'es-ES,es;q=0.9' } });
     const ct = (r.headers.get('content-type') || '').toLowerCase();
     const body = await r.text();
-    if (!r.ok) { console.error('Upstream /history', r.status, ct, body.slice(0,300)); return res.status(r.status).json({ error:'weather.com denied', status:r.status }); }
-    if (!ct.includes('application/json')) return res.status(502).json({ error:'Invalid response from weather.com' });
-    res.set('Cache-Control','public, max-age=300').type('application/json').send(body);
-  } catch (e) { console.error(e); res.status(500).json({ error:'Weather history proxy failed' }); }
+    if (!r.ok) { console.error('Upstream /history', r.status, ct, body.slice(0, 300)); return res.status(r.status).json({ error: 'weather.com denied', status: r.status }); }
+    if (!ct.includes('application/json')) return res.status(502).json({ error: 'Invalid response from weather.com' });
+    res.set('Cache-Control', 'public, max-age=300').type('application/json').send(body);
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Weather history proxy failed' }); }
 });
 
 /* ============ Función auxiliar para calcular lluvia por rango de fechas ============ */
@@ -263,11 +304,11 @@ async function calcularLluviaRango(startDate, endDate, aplicarFix2025 = false) {
 
   const dayMm = (d) => {
     let v = toNum(d?.metric?.precipTotal); if (v != null) return v;
-    v = toNum(d?.imperial?.precipTotal);   if (v != null) return in2mm(v);
-    v = toNum(d?.precipTotal);             if (v != null) return v;
-    v = toNum(d?.metric?.precip);          if (v != null) return v;
-    v = toNum(d?.precip);                  if (v != null) return v;
-    v = toNum(d?.imperial?.precip);        if (v != null) return in2mm(v);
+    v = toNum(d?.imperial?.precipTotal); if (v != null) return in2mm(v);
+    v = toNum(d?.precipTotal); if (v != null) return v;
+    v = toNum(d?.metric?.precip); if (v != null) return v;
+    v = toNum(d?.precip); if (v != null) return v;
+    v = toNum(d?.imperial?.precip); if (v != null) return in2mm(v);
     return 0;
   };
 
@@ -289,24 +330,23 @@ async function calcularLluviaRango(startDate, endDate, aplicarFix2025 = false) {
     const text = await r.text();
 
     if (!r.ok || !ct.includes('application/json')) {
-      console.warn('[WU chunk] status=', r.status, 'ct=', ct, 'range=', startDate, endDate, 'body=', text.slice(0,200));
+      console.warn('[WU chunk] status=', r.status, 'ct=', ct, 'range=', startDate, endDate, 'body=', text.slice(0, 200));
       return { observations: [] };
     }
     try { return JSON.parse(text); } catch { return { observations: [] }; }
   }
 
   const perDay = new Map();
-  const pad = (n) => String(n).padStart(2,'0');
+  const pad = (n) => String(n).padStart(2, '0');
 
   // Recorremos mes a mes
   let currentDate = new Date(startDate);
   const endDateObj = new Date(endDate);
-  
+
   while (currentDate <= endDateObj) {
     const year = currentDate.getFullYear();
     const month = currentDate.getMonth();
-    
-    const monthStart = new Date(year, month, 1);
+
     const monthEnd = new Date(year, month + 1, 0);
     const end = monthEnd > endDateObj ? endDateObj : monthEnd;
 
@@ -329,10 +369,7 @@ async function calcularLluviaRango(startDate, endDate, aplicarFix2025 = false) {
   const lista = Array.from(perDay.entries()).sort((a, b) => a[0].localeCompare(b[0]));
   let total = lista.reduce((acc, [, mm]) => acc + (Number.isFinite(mm) ? mm : 0), 0);
 
-  // Aplicar fix de +200 para 2025 si es necesario
-  if (aplicarFix2025) {
-    total += 200;
-  }
+  if (aplicarFix2025) total += 200;
 
   return {
     dias_contados: lista.length,
@@ -344,35 +381,32 @@ async function calcularLluviaRango(startDate, endDate, aplicarFix2025 = false) {
 /* ============ Lluvia acumulada (YTD) por meses (año hidrológico) ============ */
 app.get('/api/lluvia/total/year', requiereSesionUnica, async (req, res) => {
   try {
-    const apiKey    = process.env.WU_API_KEY;
+    const apiKey = process.env.WU_API_KEY;
     const stationId = process.env.WU_STATION_ID;
     if (!apiKey || !stationId) {
-      return res.status(400).json({ error:'config_missing', detalle:'Define WU_API_KEY y WU_STATION_ID' });
+      return res.status(400).json({ error: 'config_missing', detalle: 'Define WU_API_KEY y WU_STATION_ID' });
     }
 
     const now = new Date();
-    const pad = (n) => String(n).padStart(2,'0');
+    const pad = (n) => String(n).padStart(2, '0');
 
     // Calcular año hidrológico (septiembre a junio)
     let hydroYear, hydroStart, hydroEnd;
-    
-    if (now.getMonth() >= 8) { // Si estamos en septiembre o después
+
+    if (now.getMonth() >= 8) {
       hydroYear = now.getFullYear();
-      hydroStart = new Date(hydroYear, 8, 1); // 1 septiembre del año actual
-      hydroEnd = new Date(hydroYear + 1, 5, 30); // 30 junio del año siguiente
-    } else { // Si estamos antes de septiembre (enero-agosto)
+      hydroStart = new Date(hydroYear, 8, 1);
+      hydroEnd = new Date(hydroYear + 1, 5, 30);
+    } else {
       hydroYear = now.getFullYear() - 1;
-      hydroStart = new Date(hydroYear, 8, 1); // 1 septiembre del año anterior
-      hydroEnd = new Date(hydroYear + 1, 5, 30); // 30 junio del año actual
+      hydroStart = new Date(hydroYear, 8, 1);
+      hydroEnd = new Date(hydroYear + 1, 5, 30);
     }
 
-    // Si estamos dentro del año hidrológico, usar fecha actual como límite
-    if (now < hydroEnd) {
-      hydroEnd = now;
-    }
+    if (now < hydroEnd) hydroEnd = now;
 
     const formatDate = (date) => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
-    
+
     const resultado = await calcularLluviaRango(hydroStart, hydroEnd, false);
 
     if (req.query.debug === '1') {
@@ -397,7 +431,7 @@ app.get('/api/lluvia/total/year', requiereSesionUnica, async (req, res) => {
 
   } catch (e) {
     console.error('Error /api/lluvia/total/year:', e);
-    return res.status(500).json({ error:'calc_failed', detalle:String(e.message || e) });
+    return res.status(500).json({ error: 'calc_failed', detalle: String(e.message || e) });
   }
 });
 
@@ -407,13 +441,13 @@ app.get('/api/lluvia/total/2025', requiereSesionUnica, async (req, res) => {
     const apiKey = process.env.WU_API_KEY;
     const stationId = process.env.WU_STATION_ID;
     if (!apiKey || !stationId) {
-      return res.status(400).json({ error:'config_missing', detalle:'Define WU_API_KEY y WU_STATION_ID' });
+      return res.status(400).json({ error: 'config_missing', detalle: 'Define WU_API_KEY y WU_STATION_ID' });
     }
 
-    const startDate = new Date(2025, 0, 1); // 1 enero 2025
-    const endDate = new Date(2025, 11, 31); // 31 diciembre 2025
-    
-    const resultado = await calcularLluviaRango(startDate, endDate, true); // Aplicar fix +200
+    const startDate = new Date(2025, 0, 1);
+    const endDate = new Date(2025, 11, 31);
+
+    const resultado = await calcularLluviaRango(startDate, endDate, true);
 
     return res.json({
       year: '2025',
@@ -426,27 +460,27 @@ app.get('/api/lluvia/total/2025', requiereSesionUnica, async (req, res) => {
 
   } catch (e) {
     console.error('Error /api/lluvia/total/2025:', e);
-    return res.status(500).json({ error:'calc_failed', detalle:String(e.message || e) });
+    return res.status(500).json({ error: 'calc_failed', detalle: String(e.message || e) });
   }
 });
 
-/* ============ Lluvia acumulada año natural actual (2026) ============ */
+/* ============ Lluvia acumulada año natural actual ============ */
 app.get('/api/lluvia/total/current', requiereSesionUnica, async (req, res) => {
   try {
     const apiKey = process.env.WU_API_KEY;
     const stationId = process.env.WU_STATION_ID;
     if (!apiKey || !stationId) {
-      return res.status(400).json({ error:'config_missing', detalle:'Define WU_API_KEY y WU_STATION_ID' });
+      return res.status(400).json({ error: 'config_missing', detalle: 'Define WU_API_KEY y WU_STATION_ID' });
     }
 
     const now = new Date();
     const currentYear = now.getFullYear();
-    const startDate = new Date(currentYear, 0, 1); // 1 enero del año actual
-    const endDate = now; // Hasta hoy
-    
-    const resultado = await calcularLluviaRango(startDate, endDate, false); // Sin fix
+    const startDate = new Date(currentYear, 0, 1);
+    const endDate = now;
 
-    const pad = (n) => String(n).padStart(2,'0');
+    const resultado = await calcularLluviaRango(startDate, endDate, false);
+
+    const pad = (n) => String(n).padStart(2, '0');
     const formatDate = (date) => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 
     return res.json({
@@ -460,12 +494,14 @@ app.get('/api/lluvia/total/current', requiereSesionUnica, async (req, res) => {
 
   } catch (e) {
     console.error('Error /api/lluvia/total/current:', e);
-    return res.status(500).json({ error:'calc_failed', detalle:String(e.message || e) });
+    return res.status(500).json({ error: 'calc_failed', detalle: String(e.message || e) });
   }
 });
 
 /* ============ Arranque ============ */
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, '0.0.0.0', () =>
-  console.log(`🚀 http://0.0.0.0:${PORT} — listo (rutas: /verificar-sesion, /api/weather/*, /api/lluvia/total/*)`)
-);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 http://0.0.0.0:${PORT} — listo`);
+  console.log(`📦 DB: ${dbPath}`);
+  if (DATA_DIR) console.log(`💾 DATA_DIR=${DATA_DIR} (persistente si es volume)`);
+});
