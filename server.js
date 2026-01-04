@@ -505,3 +505,4 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`📦 DB: ${dbPath}`);
   if (DATA_DIR) console.log(`💾 DATA_DIR=${DATA_DIR} (persistente si es volume)`);
 });
+// DEPLOY_VERSION_%RANDOM%_%RANDOM%
